@@ -5,12 +5,12 @@ var ExampleConfig = `# This is an example config.yaml file with some sensible de
 limit: 2
 
 # Podcasts instance URL.
-url: "https://roig.is-a.dev/podcasts"
+endpoint: "https://roig.is-a.dev/podcasts"
 
 # The worker authentication token
-token: changeMe
+token: CHANGE_ME
 
 # Defines the interval length, in seconds, between new jobs check. 
-# The default value is 3. If set to 0 or lower, the default value is used.
+# The default value is 10. If set to 0 or lower, the default value is used.
 checkInterval: 10
 `

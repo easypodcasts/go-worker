@@ -49,7 +49,7 @@ func newStartCmd() *cobra.Command {
 				log.L.Fatalf("unable to decode config, %v", err)
 			}
 
-			w := worker.NewWorker(c)
+			w, err := worker.NewWorker(c)
 			err = w.Run()
 			if err != nil {
 				return err

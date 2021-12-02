@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
@@ -84,14 +85,19 @@ func (c *Client) Call(httpMethod string, method string, values url.Values, body 
 	return c.CallWithContext(ctx, httpMethod, method, values, body, length)
 }
 
-func (c *Client) CallRetryable(ctx context.Context, httpMethod string, path string, values url.Values, body io.Reader) (reply io.ReadCloser, err error) {
+func (c *Client) CallRetryable(ctx context.Context, httpMethod string, path string, headers http.Header, values url.Values, body io.Reader) (reply io.ReadCloser, err error) {
 	// Create a done channel to control
 	doneCh := make(chan struct{}, 1)
 
 	// Indicate to our routine to exit cleanly upon return.
 	defer close(doneCh)
 
+	intent := 0
 	for range newRetryTimerWithJitter(DefaultRetryUnit, DefaultRetryCap, MaxJitter, doneCh) {
+		if intent >= 3 {
+			return nil, err
+		}
+
 		// Instantiate a new request.
 		var req *http.Request
 
@@ -99,9 +105,13 @@ func (c *Client) CallRetryable(ctx context.Context, httpMethod string, path stri
 			path = path + "?" + values.Encode()
 		}
 
-		req, err := http.NewRequestWithContext(ctx, httpMethod, c.url.String()+"/"+path, body)
+		req, err = http.NewRequestWithContext(ctx, httpMethod, c.url.String()+"/"+path, body)
 		if err != nil {
 			return nil, &Error{err}
+		}
+
+		if headers != nil {
+			req.Header = headers
 		}
 
 		if c.newAuthToken != nil {
@@ -115,6 +125,7 @@ func (c *Client) CallRetryable(ctx context.Context, httpMethod string, path stri
 		if err != nil {
 			// For supported http requests errors verify.
 			if isHTTPReqErrorRetryable(err) {
+				intent++
 				continue // Retry.
 			}
 			// For other errors, return here no need to retry.
@@ -130,13 +141,15 @@ func (c *Client) CallRetryable(ctx context.Context, httpMethod string, path stri
 
 		// Verify if rest status code is retryable.
 		if isHTTPStatusRetryable(resp.StatusCode) {
+			intent++
 			continue // Retry.
 		}
 
+		err = fmt.Errorf("Response with status code: %d ", resp.StatusCode)
 		break
 	}
 
-	return nil, &Error{errors.New("failed to fetch the resource: " + c.url.String() + "/" + path + "?" + values.Encode())}
+	return nil, &Error{err}
 }
 
 // Close closes all idle connections of the underlying rest client

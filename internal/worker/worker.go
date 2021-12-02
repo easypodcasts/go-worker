@@ -1,23 +1,41 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"mime/multipart"
+	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/buger/goterm"
 	"github.com/easypodcasts/go-worker/pkg/config"
+	"github.com/easypodcasts/go-worker/pkg/ffmpeg"
 	"github.com/easypodcasts/go-worker/pkg/log"
 	"github.com/easypodcasts/go-worker/pkg/network"
+	"github.com/easypodcasts/go-worker/pkg/progress"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/sirupsen/logrus"
 )
 
 const (
 	ShutdownTimeout  = 30
 	MinCheckInterval = 3
+)
+
+var (
+	ErrEmptyJob     = errors.New("no episodes to convert")
+	ErrUnauthorized = errors.New("check your token")
 )
 
 type Worker struct {
@@ -48,19 +66,23 @@ type Job struct {
 	URL string
 }
 
-func NewWorker(c config.Config) *Worker {
-	client, err := network.NewClient(c.Endpoint, network.DefaultTimeout, func() string {
+func NewWorker(c config.Config) (*Worker, error) {
+	endpoint, err := url.Parse(c.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	client, err := network.NewClient(*endpoint, network.DefaultTimeout, func() string {
 		return c.Token
 	})
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 
 	return &Worker{
 		c:      c,
 		client: client,
 		sem:    make(chan struct{}, c.Limit),
-	}
+	}, nil
 }
 
 func (w *Worker) Run() error {
@@ -77,23 +99,27 @@ func (w *Worker) Run() error {
 	w.startShutdown = make(chan struct{}, 1)
 
 	go func() {
-		runners := make(chan Job)
-		go w.feedRunners(runners)
+		_ = progress.Run(context.Background(), func(ctxRun context.Context) error {
 
-		stopWorker := make(chan bool)
-		w.startWorkers(stopWorker, runners)
+			runners := make(chan Job)
+			go w.feedRunners(runners)
 
-		// Block until shutdown is started
-		<-w.startShutdown
+			stopWorker := make(chan struct{})
+			w.startWorkers(ctxRun, stopWorker, runners)
 
-		// Wait for workers to shutdown
-		for currentWorkers := w.c.Limit; currentWorkers > 0; currentWorkers-- {
-			stopWorker <- true
-		}
+			// Block until shutdown is started
+			<-w.startShutdown
 
-		log.L.Info("All workers stopped. Can exit now")
+			// Wait for workers to shutdown
+			for currentWorkers := w.c.Limit; currentWorkers > 0; currentWorkers-- {
+				stopWorker <- struct{}{}
+			}
 
-		close(w.runFinished)
+			log.L.Info("All workers stopped. Can exit now")
+
+			close(w.runFinished)
+			return nil
+		})
 	}()
 
 	return nil
@@ -150,6 +176,8 @@ func (w *Worker) Shutdown(signal os.Signal) error {
 // applied.
 func (w *Worker) feedRunners(jobs chan Job) {
 	for w.stopSignal == nil {
+		w.sem <- struct{}{}
+
 		log.L.Debugln("Feeding jobs to channel")
 
 		interval := time.Duration(w.c.CheckInterval) * time.Second / time.Duration(w.c.Limit)
@@ -158,13 +186,20 @@ func (w *Worker) feedRunners(jobs chan Job) {
 			interval = MinCheckInterval
 		}
 
-		// fetchJob
-
-		// Feed runner with waiting exact amount of time
-		jobs <- Job{
-			ID:  1,
-			URL: "https://testing.com",
+		// Feed runner
+		job, err := w.fetchJob(context.Background())
+		if err != nil {
+			switch err {
+			case ErrEmptyJob, ErrUnauthorized:
+				log.L.WithError(err).Debugln()
+			default:
+				log.L.WithError(err).Errorln()
+			}
+		} else {
+			jobs <- job
 		}
+
+		<-w.sem
 		log.L.Debugln("Sleep", interval)
 		time.Sleep(interval)
 	}
@@ -176,24 +211,25 @@ func (w *Worker) feedRunners(jobs chan Job) {
 
 // startWorkers is responsible for starting the workers (up to the number
 // defined by `Limit`) and assigning a runner processing method to them.
-func (w *Worker) startWorkers(stopWorker chan bool, jobs chan Job) {
+func (w *Worker) startWorkers(ctx context.Context, stopWorker chan struct{}, jobs chan Job) {
 	for i := 0; i < w.c.Limit; i++ {
-		go w.processRunners(i, stopWorker, jobs)
+		go w.processRunners(ctx, i, stopWorker, jobs)
 	}
 }
 
 // processRunners is responsible for processing a Runner on a worker (when received
 // a runner information sent to the channel by feedRunners) and for terminating the worker
 // (when received an information on stoWorker chan - provided by updateWorkers)
-func (w *Worker) processRunners(id int, stopWorker chan bool, jobs chan Job) {
-	ctx := log.WithLogger(context.Background(), logrus.WithField("worker", id))
-	log.G(ctx).Debugln("Starting worker")
+func (w *Worker) processRunners(ctx context.Context, id int, stopWorker chan struct{}, jobs chan Job) {
+	ctxLog := log.WithLogger(context.Background(), logrus.WithField("worker", id))
+	log.G(ctxLog).Debugln("Starting worker")
 
 	for w.stopSignal == nil {
 		select {
 		case job := <-jobs:
 			err := w.processJob(ctx, job)
 			if err != nil {
+				w.cancelJob(ctx, job)
 				log.G(ctx).WithFields(logrus.Fields{
 					"job": job.ID,
 				}).WithError(err)
@@ -216,6 +252,11 @@ func (w *Worker) processRunners(id int, stopWorker chan bool, jobs chan Job) {
 
 // processJob is responsible for handling one job on a specified runner.
 func (w *Worker) processJob(ctx context.Context, job Job) (err error) {
+	w.sem <- struct{}{}
+	defer func() { <-w.sem }()
+
+	writer := progress.ContextWriter(ctx)
+
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
@@ -225,57 +266,86 @@ func (w *Worker) processJob(ctx context.Context, job Job) (err error) {
 	runContext, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 
+	dir, err := ioutil.TempDir("/tmp/", "easypodcast")
+	if err != nil {
+		log.G(ctx).WithError(err).Errorln()
+		return err
+	}
+	defer func(path string) {
+		_ = os.RemoveAll(path)
+	}(dir)
+
 	// Run ffmpeg script
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				//runPanic <- &BuildError{FailureReason: RunnerSystemFailure, Inner: fmt.Errorf("panic: %s", r)}
+				runPanic <- fmt.Errorf("panic: %s", r)
 			}
 		}()
 
-		runFinish <- executeScript(runContext, job)
+		runFinish <- executeScript(runContext, dir, job)
 	}()
 
 	// Wait for signals: cancel, timeout, abort or finish
-	log.G(ctx).Debugln("Waiting for signals...")
+	log.G(ctx).WithError(err).Debugln("Waiting for build to finish...")
 	select {
 	case <-ctx.Done():
+		writer.Event(progress.NewEvent(strconv.Itoa(job.ID), progress.Error, ctx.Err().Error()))
 		return ctx.Err()
 
-	case signal := <-w.abortBuilds:
-		_ = signal
-		//err = &BuildError{
-		//	Inner:         fmt.Errorf("aborted: %v", signal),
-		//	FailureReason: RunnerSystemFailure,
-		//}
-		//b.setCurrentState(BuildRunRuntimeTerminated)
+	case s := <-w.abortBuilds:
+		writer.Event(progress.NewEvent(strconv.Itoa(job.ID), progress.Error, s.String()))
+		return ctx.Err()
 
 	case err = <-runFinish:
 		if err != nil {
-			//b.setCurrentState(BuildRunRuntimeFailed)
-		} else {
-			//b.setCurrentState(BuildRunRuntimeSuccess)
+			writer.Event(progress.NewEvent(strconv.Itoa(job.ID), progress.Error, err.Error()))
+			return err
 		}
+		writer.Event(progress.NewEvent(strconv.Itoa(job.ID), progress.Working, "Uploading..."))
+		err = w.uploadEpisode(ctx, job, dir)
+		if err != nil {
+			writer.Event(progress.NewEvent(strconv.Itoa(job.ID), progress.Error, err.Error()))
+			return err
+		}
+		writer.Event(progress.NewEvent(strconv.Itoa(job.ID), progress.Done, ""))
 		return err
 
 	case err = <-runPanic:
-		//b.setCurrentState(BuildRunRuntimeTerminated)
+		writer.Event(progress.NewEvent(strconv.Itoa(job.ID), progress.Error, err.Error()))
 		return err
-	}
-
-	log.G(ctx).WithError(err).Debugln("Waiting for build to finish...")
-
-	select {
-	case <-runFinish:
-		return
-	case <-ctx.Done():
-		log.G(ctx).Warningln("Timed out waiting for the build to finish")
-		return
 	}
 }
 
-func executeScript(ctx context.Context, job Job) error {
-	time.Sleep(20 * time.Second)
+func executeScript(ctx context.Context, dir string, job Job) error {
+	t := ffmpeg.NewTranscoder(job.URL)
+
+	w := progress.ContextWriter(ctx)
+
+	run := t.Run(dir, true)
+
+	for out := range t.Output() {
+		pbBox := ""
+
+		if goterm.Width() > 110 {
+			numSpaces := 0
+			if 50-out.Progress > 0 {
+				numSpaces = 50 - out.Progress
+			}
+			pbBox = fmt.Sprintf("[%s>%s]", strings.Repeat("=", out.Progress), strings.Repeat(" ", numSpaces))
+		}
+
+		w.Event(progress.NewEvent(
+			strconv.Itoa(job.ID),
+			progress.Working,
+			fmt.Sprintf("%s %d%%", pbBox, out.Progress),
+		))
+	}
+
+	err := <-run
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -355,4 +425,90 @@ func (w *Worker) abortAllBuilds() {
 	for {
 		w.abortBuilds <- w.stopSignal
 	}
+}
+
+func (w *Worker) fetchJob(ctx context.Context) (Job, error) {
+	respBody, err := w.client.CallRetryable(ctx, http.MethodGet, "api/next", nil, nil, nil)
+	if err != nil {
+		return Job{}, err
+	}
+	defer network.DrainBody(respBody)
+
+	body, err := io.ReadAll(respBody)
+	if err != nil {
+		return Job{}, err
+	}
+
+	var job Job
+
+	// RESP can be:
+	// noop -> No episodes to convert
+	// Unauthorized -> Check your token
+	// {id: some_number, url: some url} -> Get to work
+	switch string(body) {
+	case "\"noop\"":
+		return Job{}, ErrEmptyJob
+	case "\"Unauthorized\"":
+		return Job{}, ErrUnauthorized
+	default:
+		errDec := jsoniter.Unmarshal(body, &job)
+		if errDec != nil {
+			return Job{}, errDec
+		}
+	}
+
+	return job, nil
+}
+
+func (w *Worker) uploadEpisode(ctx context.Context, job Job, dir string) error {
+
+	file, err := os.Open(dir + "/episode.opus")
+	if err != nil {
+		return err
+	}
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	_ = writer.WriteField("id", strconv.Itoa(job.ID))
+	part, err := writer.CreateFormFile("audio", filepath.Base(dir+"/episode.opus"))
+	if err != nil {
+		return err
+	}
+
+	_, err = io.Copy(part, file)
+	if err != nil {
+		return err
+	}
+
+	err = writer.Close()
+	if err != nil {
+		return err
+	}
+
+	h := http.Header{}
+	h.Add("Content-Type", writer.FormDataContentType())
+
+	respBody, err := w.client.CallRetryable(ctx, http.MethodPost, "api/converted", h, nil, body)
+	if err != nil {
+		log.G(ctx).WithError(err).Errorln("Failed to upload")
+		return err
+	}
+	defer network.DrainBody(respBody)
+
+	return nil
+}
+
+func (w *Worker) cancelJob(ctx context.Context, job Job) {
+	h := http.Header{}
+	h.Add("Content-Type", "application/x-www-form-urlencoded")
+
+	form := url.Values{}
+	form.Add("id", strconv.Itoa(job.ID))
+
+	respBody, err := w.client.CallRetryable(ctx, http.MethodPost, "api/cancel", h, nil, strings.NewReader(form.Encode()))
+	if err != nil {
+		log.G(ctx).WithError(err).Errorln("Failed to cancel")
+	}
+	defer network.DrainBody(respBody)
 }

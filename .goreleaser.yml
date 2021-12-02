@@ -1,0 +1,29 @@
+before:
+  hooks:
+    - go mod tidy
+
+project_name: go-worker
+
+builds:
+  - env: [ CGO_ENABLED=0 ]
+    ldflags: -s -w -X github.com/easypodcasts/go-worker/internal/build.Version={{.Version}}
+    binary: go-worker
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+dockers:
+  - image_templates:
+      - "ghcr.io/easypodcasts/go-worker:latest"
+      - "ghcr.io/easypodcasts/go-worker:{{.Version}}"
+    dockerfile: Dockerfile
+    use: buildx
+    build_flag_templates:
+      - --label=org.opencontainers.image.title={{ .ProjectName }}
+      - --label=org.opencontainers.image.description={{ .ProjectName }}
+      - --label=org.opencontainers.image.url=https://github.com/easypodcasts/go-worker
+      - --label=org.opencontainers.image.source=https://github.com/easypodcasts/go-worker
+      - --label=org.opencontainers.image.version={{ .Version }}
+      - --label=org.opencontainers.image.revision={{ .FullCommit }}
