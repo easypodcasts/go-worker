@@ -16,16 +16,7 @@ import (
 // DefaultTimeout - default timeout is 30 seconds.
 const DefaultTimeout = 30 * time.Second
 
-// Error - error type in case of errors related to network/transport
-// for ex. connection refused, connection reset, dns resolution failure etc.
-// All errors returned by storage-rest-server (ex errFileNotFound, errDiskNotFound) are not considered to be network errors.
-type Error struct {
-	Err error
-}
-
-func (n *Error) Error() string {
-	return n.Err.Error()
-}
+var MaxAttemptError = errors.New("the maximum number of attempts was exceeded")
 
 // Client - rest based RPC client.
 type Client struct {
@@ -45,7 +36,7 @@ func (c *Client) CallWithContext(ctx context.Context, httpMethod string, path st
 
 	req, err := http.NewRequestWithContext(ctx, httpMethod, c.url.String()+"/"+path, body)
 	if err != nil {
-		return nil, &Error{err}
+		return nil, err
 	}
 
 	if c.newAuthToken != nil {
@@ -58,7 +49,7 @@ func (c *Client) CallWithContext(ctx context.Context, httpMethod string, path st
 
 	resp, errDo := c.httpClient.Do(req)
 	if errDo != nil {
-		return nil, &Error{err}
+		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -95,7 +86,7 @@ func (c *Client) CallRetryable(ctx context.Context, httpMethod string, path stri
 	intent := 0
 	for range newRetryTimerWithJitter(DefaultRetryUnit, DefaultRetryCap, MaxJitter, doneCh) {
 		if intent >= 3 {
-			return nil, err
+			return nil, MaxAttemptError
 		}
 
 		// Instantiate a new request.
@@ -107,7 +98,7 @@ func (c *Client) CallRetryable(ctx context.Context, httpMethod string, path stri
 
 		req, err = http.NewRequestWithContext(ctx, httpMethod, c.url.String()+"/"+path, body)
 		if err != nil {
-			return nil, &Error{err}
+			return nil, err
 		}
 
 		if headers != nil {
@@ -149,7 +140,7 @@ func (c *Client) CallRetryable(ctx context.Context, httpMethod string, path stri
 		break
 	}
 
-	return nil, &Error{err}
+	return nil, err
 }
 
 // Close closes all idle connections of the underlying rest client
