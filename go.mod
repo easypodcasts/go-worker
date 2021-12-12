@@ -3,7 +3,7 @@ module github.com/easypodcasts/go-worker
 go 1.17
 
 require (
-	github.com/buger/goterm v1.0.3
+	github.com/buger/goterm v1.0.0
 	github.com/containerd/console v1.0.3
 	github.com/fatih/color v1.9.0
 	github.com/json-iterator/go v1.1.11
