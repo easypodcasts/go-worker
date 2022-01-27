@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -266,7 +265,7 @@ func (w *Worker) processJob(ctx context.Context, job Job) (err error) {
 	runContext, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 
-	dir, err := ioutil.TempDir("/tmp/", "easypodcast")
+	dir, err := os.MkdirTemp("", "easypodcast")
 	if err != nil {
 		log.G(ctx).WithError(err).Errorln()
 		return err
