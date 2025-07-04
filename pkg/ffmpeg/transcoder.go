@@ -44,6 +44,7 @@ func (t Transcoder) GetCommand() []string {
 		"-user_agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/95.0.4638.54 Safari/537.36",
 		"-i",
 		t.inputMedia,
+		"-vn",
 		"-ac", "1",
 		"-c:a", "libopus",
 		"-b:a", "24k",
@@ -53,7 +54,7 @@ func (t Transcoder) GetCommand() []string {
 		"-application", "voip",
 		"-metadata", "Description=Easypodcast",
 		"-metadata", fmt.Sprintf("encoder_version=\"easypodcast-go %s\"", build.Version),
-		"episode.opus",
+		"episode.mp4",
 	}
 	return args
 }
