@@ -461,7 +461,7 @@ func (w *Worker) fetchJob(ctx context.Context) (Job, error) {
 
 func (w *Worker) uploadEpisode(ctx context.Context, job Job, dir string) error {
 
-	file, err := os.Open(dir + "/episode.opus")
+	file, err := os.Open(dir + "/episode.mp4")
 	if err != nil {
 		return err
 	}
@@ -470,7 +470,7 @@ func (w *Worker) uploadEpisode(ctx context.Context, job Job, dir string) error {
 	writer := multipart.NewWriter(body)
 
 	_ = writer.WriteField("id", strconv.Itoa(job.ID))
-	part, err := writer.CreateFormFile("audio", filepath.Base(dir+"/episode.opus"))
+	part, err := writer.CreateFormFile("audio", filepath.Base(dir+"/episode.mp4"))
 	if err != nil {
 		return err
 	}
